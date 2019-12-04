@@ -1,0 +1,258 @@
+#!/bin/bash
+
+# Authors:
+#
+#     Tomas Halman <tomas@halman.net>
+#
+# Copyright (C) 2019 Tomas Halman
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#
+# Information about how to perform live backup found at
+# https://wiki.libvirt.org/page/Live-disk-backup-with-active-blockcommit
+#
+
+DEST=`pwd`
+DEBUG=no
+ARCHIVE=no
+COMPRESS=no
+
+declare -a IMAGES
+declare -a TARGETS
+declare -a SNAPSHOTS
+
+usage(){
+    echo "`basename $0` [options] domain"
+    echo "  --destination|--dest|-D  destination folder"
+    echo "  --archive|-a             tar the backup"
+    echo "  --gz|-z                  gzip tar"
+}
+
+die(){
+    echo "$1" >&2
+    remove_snapshot
+    exit 1
+}
+
+copy() {
+    local base
+    local dest
+
+    if [ -d "$2" ] ; then
+        base=`basename "$1"`
+        dest="$2/$base"
+    else
+        dest="$2"
+    fi
+
+    cp -v "$1" "$dest"
+    return $?
+}
+
+
+domain_exists() {
+    virsh domstate "$DOMAIN" >/dev/null 2>&1
+    return $?
+}
+
+
+is_running() {
+    if [ `virsh domstate "$DOMAIN" 2>/dev/null | grep running | wc -l` -eq 0 ]; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+
+list_blockdevices() {
+    virsh domblklist "$DOMAIN" | tail -n +3 | grep -E  '^[^ ]+ +/'
+}
+
+
+snapshot_diskspec() {
+    local cnt
+    local i
+
+    cnt="${#TARGETS[@]}"
+    for i in `seq 0 $((cnt-1))`; do
+        echo "--diskspec ${TARGETS[$i]},file=${SNAPSHOTS[$i]}"
+    done
+}
+
+
+read_disk_info() {
+    local i
+    local idx
+
+    idx=0
+    for i in `list_blockdevices | awk '{ print $1 }'`; do
+        TARGETS[$idx]="$i"
+        idx=$((idx+1))
+    done
+    idx=0
+    for i in `list_blockdevices | awk '{ print $2 }'`; do
+        IMAGES[$idx]="$i"
+        SNAPSHOTS[$idx]="$i.snapshot.img"
+        idx=$((idx+1))
+    done
+}
+
+
+copy_disk_images() {
+    local image
+
+    echo "Copying files to $DESTDIR"
+
+    for image in "${IMAGES[@]}"; do
+        copy "$image" "$DESTDIR"
+        if [ "$?" != "0" ] ; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+
+remove_snapshot() {
+    local i
+    local cnt
+
+    echo "Removing snapshot"
+
+    cnt="${#TARGETS[@]}"
+    for i in `seq 0 $((cnt-1))`; do
+        if [ -f "${SNAPSHOTS[$i]}" ] ; then
+            (
+                virsh blockcommit "$DOMAIN" "${TARGETS[$i]}" --active --verbose --pivot &&
+                    rm -f "${SNAPSHOTS[$i]}"
+            ) || echo "Failed to remove snapshot '${SNAPSHOTS[$i]}'"
+        fi
+    done
+}
+
+
+create_snapshot(){
+    echo "Creating snapshot"
+
+    virsh snapshot-create-as --domain "$DOMAIN" vbackup-snapshot \
+          `snapshot_diskspec` \
+          --disk-only --atomic --no-metadata --quiesce >/dev/null 2>&1 || \
+        virsh snapshot-create-as --domain "$DOMAIN" vbackup-snapshot \
+              `snapshot_diskspec` \
+              --disk-only --atomic --no-metadata ||
+        return 1
+    return 0
+}
+
+live_backup() {
+    create_snapshot || die "Error while creating domain snapshot"
+
+    copy_disk_images || die "Error while copying disk images"
+
+    remove_snapshot || die "Error while removing snapshots"
+}
+
+
+cold_backup() {
+    copy_disk_images || die "Error while copying disk images"
+}
+
+
+backup() {
+    domain_exists || die "Domain '$DOMAIN' doesn't exist"
+    read_disk_info
+
+    rm -rf "$DESTDIR" >/dev/null 2>&1
+    mkdir "$DESTDIR"
+
+    if is_running; then
+        live_backup
+    else
+        cold_backup
+    fi
+
+    echo "Saving xml configuration"
+    virsh dumpxml "$DOMAIN" > "$DESTDIR/config.xml" || die "Error while saving config.xml"
+}
+
+archive() {
+    local OPTS
+    local FILE
+
+    if [ "$ARCHIVE" = "yes" ]; then
+        if [ "$COMPRESS" = "yes" ]; then
+            OPTS="-cvzf"
+            FILE="$DESTDIR.tgz"
+        else
+            OPTS="-cvf"
+            FILE="$DESTDIR.tar"
+        fi
+
+        if [ -f "$FILE" ]; then
+            rm $FILE
+        fi
+        echo "Creating archive $FILE"
+        tar $OPTS "$FILE" -C "$DEST" "$DOMAIN" || die "Error while creating archive"
+        rm -rf "$DESTDIR"
+    fi
+}
+
+
+while [ "$#" -ne 0 ]; do
+    case "$1" in
+        --destination|--dest|-D)
+            DEST="$2"
+            shift
+            ;;
+        --debug)
+            DEBUG=yes
+            ;;
+        --archive|-a)
+            ARCHIVE=yes
+            ;;
+        --gz|-z)
+            COMPRESS=yes
+            ;;
+        --help|-h|-?)
+            usage
+            exit 0
+            ;;
+        *)
+            DOMAIN="$1"
+            ;;
+    esac
+    shift
+done
+
+if [ "$DOMAIN" = "" ]; then
+    usage
+    exit 1
+fi
+
+if [ `id -u` != 0 ]; then
+    echo "Must run as root" >&2
+    exit 1
+fi
+
+if [ "$DEBUG" = "yes" ]; then
+    set -x
+fi
+
+export LC_ALL=C
+DESTDIR="$DEST/$DOMAIN"
+
+echo "Backuping $DOMAIN"
+backup
+archive
+echo "Done"
